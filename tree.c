@@ -1,40 +1,134 @@
-// tree.c — Tree object serialization and construction
-//
-// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
-//
-// Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
-//
-// Example single entry (conceptual):
-//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
+// tree.c — Tree object implementation for PES-VCS
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 
-// ─── Mode Constants ─────────────────────────────────────────────────────────
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+int hex_to_hash(const char *hex, ObjectID *id_out);
 
-#define MODE_FILE      0100644
-#define MODE_EXEC      0100755
-#define MODE_DIR       0040000
-
-// ─── PROVIDED ───────────────────────────────────────────────────────────────
-
-// Determine the object mode for a filesystem path.
-uint32_t get_file_mode(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) != 0) return 0;
-
-    if (S_ISDIR(st.st_mode))  return MODE_DIR;
-    if (st.st_mode & S_IXUSR) return MODE_EXEC;
-    return MODE_FILE;
+// Sort tree entries by name
+static int cmp_entries(const void *a, const void *b) {
+    const TreeEntry *x = (const TreeEntry *)a;
+    const TreeEntry *y = (const TreeEntry *)b;
+    return strcmp(x->name, y->name);
 }
 
-// Parse binary tree data into a Tree struct safely.
+// Parse raw tree object
+int tree_parse(const void *data, size_t len, Tree *tree_out) {
+    tree_out->count = 0;
+
+    const unsigned char *ptr = data;
+    const unsigned char *end = ptr + len;
+
+    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
+        TreeEntry *e = &tree_out->entries[tree_out->count];
+
+        const unsigned char *space = memchr(ptr, ' ', end - ptr);
+        if (!space) return -1;
+
+        char modebuf[16] = {0};
+        memcpy(modebuf, ptr, space - ptr);
+        e->mode = strtol(modebuf, NULL, 8);
+
+        ptr = space + 1;
+
+        const unsigned char *nul = memchr(ptr, '\0', end - ptr);
+        if (!nul) return -1;
+
+        size_t name_len = nul - ptr;
+        memcpy(e->name, ptr, name_len);
+        e->name[name_len] = '\0';
+
+        ptr = nul + 1;
+
+        if (ptr + HASH_SIZE > end) return -1;
+
+        memcpy(e->hash.hash, ptr, HASH_SIZE);
+        ptr += HASH_SIZE;
+
+        tree_out->count++;
+    }
+
+    return 0;
+}
+
+// Serialize tree
+int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
+    Tree copy = *tree;
+
+    qsort(copy.entries, copy.count, sizeof(TreeEntry), cmp_entries);
+
+    size_t max = copy.count * 320;
+    unsigned char *buf = malloc(max);
+    if (!buf) return -1;
+
+    size_t off = 0;
+
+    for (int i = 0; i < copy.count; i++) {
+        TreeEntry *e = &copy.entries[i];
+
+        int n = sprintf((char *)buf + off, "%o %s", e->mode, e->name);
+        off += n + 1;
+
+        memcpy(buf + off, e->hash.hash, HASH_SIZE);
+        off += HASH_SIZE;
+    }
+
+    *data_out = buf;
+    *len_out = off;
+
+    return 0;
+}
+
+// Build tree from .pes/index
+int tree_from_index(ObjectID *id_out) {
+    FILE *fp = fopen(".pes/index", "r");
+    if (!fp) return -1;
+
+    Tree tree;
+    tree.count = 0;
+
+    while (tree.count < MAX_TREE_ENTRIES) {
+        TreeEntry *e = &tree.entries[tree.count];
+
+        char hex[65];
+        unsigned int mode;
+        unsigned long long mtime;
+        unsigned int size;
+        char path[512];
+
+        int rc = fscanf(fp, "%u %64s %llu %u %511s",
+                        &mode,
+                        hex,
+                        &mtime,
+                        &size,
+                        path);
+
+        if (rc != 5) break;
+
+        e->mode = mode;
+        hex_to_hash(hex, &e->hash);
+        strcpy(e->name, path);
+
+        tree.count++;
+    }
+
+    fclose(fp);
+
+    void *raw;
+    size_t raw_len;
+
+    if (tree_serialize(&tree, &raw, &raw_len) != 0)
+        return -1;
+
+    int rc = object_write(OBJ_TREE, raw, raw_len, id_out);
+
+    free(raw);
+    return rc;
+}// Parse binary tree data into a Tree struct safely.
 // Returns 0 on success, -1 on parse error.
 int tree_parse(const void *data, size_t len, Tree *tree_out) {
     tree_out->count = 0;
