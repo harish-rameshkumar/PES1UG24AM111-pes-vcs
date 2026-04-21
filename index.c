@@ -1,32 +1,15 @@
-// index.c — Staging area implementation
-//
-// Text format of .pes/index (one entry per line, sorted by path):
-//
-//   <mode-octal> <64-char-hex-hash> <mtime-seconds> <size> <path>
-//
-// Example:
-//   100644 a1b2c3d4e5f6...  1699900000 42 README.md
-//   100644 f7e8d9c0b1a2...  1699900100 128 src/main.c
-//
-// This is intentionally a simple text format. No magic numbers, no
-// binary parsing. The focus is on the staging area CONCEPT (tracking
-// what will go into the next commit) and ATOMIC WRITES (temp+rename).
-//
-// PROVIDED functions: index_find, index_remove, index_status
-// TODO functions:     index_load, index_save, index_add
+// index.c — Index / staging area implementation for PES-VCS
 
 #include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <dirent.h>
 
-// ─── PROVIDED ────────────────────────────────────────────────────────────────
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
-// Find an index entry by path (linear scan).
+// Find file in index
 IndexEntry* index_find(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0)
@@ -35,6 +18,152 @@ IndexEntry* index_find(Index *index, const char *path) {
     return NULL;
 }
 
+// Load .pes/index
+int index_load(Index *index) {
+    index->count = 0;
+
+    FILE *fp = fopen(INDEX_FILE, "r");
+    if (!fp) return 0;
+
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *e = &index->entries[index->count];
+
+        char hex[65];
+
+        int rc = fscanf(fp, "%u %64s %lu %u %511s",
+                        &e->mode,
+                        hex,
+                        &e->mtime_sec,
+                        &e->size,
+                        e->path);
+
+        if (rc != 5)
+            break;
+
+        hex_to_hash(hex, &e->hash);
+        index->count++;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// Sort by path
+static int cmp_entries(const void *a, const void *b) {
+    const IndexEntry *x = (const IndexEntry *)a;
+    const IndexEntry *y = (const IndexEntry *)b;
+    return strcmp(x->path, y->path);
+}
+
+// Save .pes/index
+int index_save(const Index *index) {
+    qsort((void *)index->entries,
+          index->count,
+          sizeof(IndexEntry),
+          cmp_entries);
+
+    FILE *fp = fopen(INDEX_FILE, "w");
+    if (!fp) return -1;
+
+    for (int i = 0; i < index->count; i++) {
+        char hex[65];
+        hash_to_hex(&index->entries[i].hash, hex);
+
+        fprintf(fp, "%u %s %lu %u %s\n",
+                index->entries[i].mode,
+                hex,
+                index->entries[i].mtime_sec,
+                index->entries[i].size,
+                index->entries[i].path);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// Add file to staging
+int index_add(Index *index, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+
+    void *buf = malloc(size);
+    if (!buf) {
+        fclose(fp);
+        return -1;
+    }
+
+    fread(buf, 1, size, fp);
+    fclose(fp);
+
+    ObjectID oid;
+
+    if (object_write(OBJ_BLOB, buf, size, &oid) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    free(buf);
+
+    struct stat st;
+    stat(path, &st);
+
+    IndexEntry *entry = index_find(index, path);
+
+    if (!entry) {
+        if (index->count >= MAX_INDEX_ENTRIES)
+            return -1;
+
+        entry = &index->entries[index->count++];
+        strcpy(entry->path, path);
+    }
+
+    entry->mode = 100644;
+    entry->hash = oid;
+    entry->mtime_sec = st.st_mtime;
+    entry->size = st.st_size;
+
+    return index_save(index);
+}
+
+// Remove from index
+int index_remove(Index *index, const char *path) {
+    for (int i = 0; i < index->count; i++) {
+        if (strcmp(index->entries[i].path, path) == 0) {
+            for (int j = i; j < index->count - 1; j++) {
+                index->entries[j] = index->entries[j + 1];
+            }
+
+            index->count--;
+            return index_save(index);
+        }
+    }
+
+    return -1;
+}
+
+// Show status
+int index_status(const Index *index) {
+    printf("Staged changes:\n");
+
+    if (index->count == 0)
+        printf("  (nothing to show)\n");
+    else {
+        for (int i = 0; i < index->count; i++)
+            printf("  staged:     %s\n", index->entries[i].path);
+    }
+
+    printf("\nUnstaged changes:\n");
+    printf("  (nothing to show)\n");
+
+    printf("\nUntracked files:\n");
+    printf("  (nothing to show)\n\n");
+
+    return 0;
+}
 // Remove a file from the index.
 // Returns 0 on success, -1 if path not in index.
 int index_remove(Index *index, const char *path) {
