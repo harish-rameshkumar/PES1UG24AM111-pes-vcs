@@ -1,18 +1,4 @@
-// commit.c — Commit creation and history traversal
-//
-// Commit object format (stored as text, one field per line):
-//
-//   tree <64-char-hex-hash>
-//   parent <64-char-hex-hash>        ← omitted for the first commit
-//   author <name> <unix-timestamp>
-//   committer <name> <unix-timestamp>
-//
-//   <commit message>
-//
-// Note: there is a blank line between the headers and the message.
-//
-// PROVIDED functions: commit_parse, commit_serialize, commit_walk, head_read, head_update
-// TODO functions:     commit_create
+// commit.c — Commit object implementation for PES-VCS
 
 #include "commit.h"
 #include "index.h"
@@ -20,21 +6,217 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <inttypes.h>
 #include <time.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <inttypes.h>
 
-// Forward declarations (implemented in object.c)
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
 
-// ─── PROVIDED ────────────────────────────────────────────────────────────────
+// Read HEAD commit hash
+int head_read(ObjectID *id_out) {
+    FILE *fp = fopen(HEAD_FILE, "r");
+    if (!fp) return -1;
 
-// Parse raw commit data into a Commit struct.
-int commit_parse(const void *data, size_t len, Commit *commit_out) {
+    char line[512];
+
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    line[strcspn(line, "\n")] = '\0';
+
+    if (strncmp(line, "ref: ", 5) == 0) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", PES_DIR, line + 5);
+
+        fp = fopen(path, "r");
+        if (!fp) return -1;
+
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp);
+            return -1;
+        }
+
+        fclose(fp);
+        line[strcspn(line, "\n")] = '\0';
+    }
+
+    return hex_to_hash(line, id_out);
+}
+
+// Update HEAD branch
+int head_update(const ObjectID *new_commit) {
+    FILE *fp = fopen(HEAD_FILE, "r");
+    if (!fp) return -1;
+
+    char line[512];
+
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    line[strcspn(line, "\n")] = '\0';
+
+    char path[512];
+
+    if (strncmp(line, "ref: ", 5) == 0)
+        snprintf(path, sizeof(path), "%s/%s", PES_DIR, line + 5);
+    else
+        strcpy(path, HEAD_FILE);
+
+    fp = fopen(path, "w");
+    if (!fp) return -1;
+
+    char hex[65];
+    hash_to_hex(new_commit, hex);
+
+    fprintf(fp, "%s\n", hex);
+    fclose(fp);
+
+    return 0;
+}
+
+// Serialize commit object
+int commit_serialize(const Commit *c, void **data_out, size_t *len_out) {
+    char tree_hex[65];
+    char parent_hex[65];
+
+    hash_to_hex(&c->tree, tree_hex);
+
+    char buf[8192];
+    int n = 0;
+
+    n += sprintf(buf + n, "tree %s\n", tree_hex);
+
+    if (c->has_parent) {
+        hash_to_hex(&c->parent, parent_hex);
+        n += sprintf(buf + n, "parent %s\n", parent_hex);
+    }
+
+    n += sprintf(buf + n,
+                 "author %s %" PRIu64 "\n"
+                 "committer %s %" PRIu64 "\n"
+                 "\n"
+                 "%s",
+                 c->author, c->timestamp,
+                 c->author, c->timestamp,
+                 c->message);
+
+    *data_out = malloc(n + 1);
+    memcpy(*data_out, buf, n + 1);
+
+    *len_out = n;
+    return 0;
+}
+
+// Parse commit object
+int commit_parse(const void *data, size_t len, Commit *out) {
     (void)len;
-    const char *p = (const char *)data;
+
+    const char *p = data;
+    char hex[65];
+
+    if (sscanf(p, "tree %64s", hex) != 1)
+        return -1;
+
+    hex_to_hash(hex, &out->tree);
+
+    p = strchr(p, '\n') + 1;
+
+    if (strncmp(p, "parent ", 7) == 0) {
+        sscanf(p, "parent %64s", hex);
+        hex_to_hash(hex, &out->parent);
+        out->has_parent = 1;
+        p = strchr(p, '\n') + 1;
+    } else {
+        out->has_parent = 0;
+    }
+
+    sscanf(p, "author %255[^\n]", out->author);
+
+    char *last = strrchr(out->author, ' ');
+    out->timestamp = strtoull(last + 1, NULL, 10);
+    *last = '\0';
+
+    p = strstr(p, "\n\n");
+    if (!p) return -1;
+
+    strcpy(out->message, p + 2);
+
+    return 0;
+}
+
+// Create commit
+int commit_create(const char *message, ObjectID *commit_id_out) {
+    ObjectID tree_id;
+
+    if (tree_from_index(&tree_id) != 0)
+        return -1;
+
+    Commit c;
+    memset(&c, 0, sizeof(c));
+
+    c.tree = tree_id;
+
+    if (head_read(&c.parent) == 0)
+        c.has_parent = 1;
+    else
+        c.has_parent = 0;
+
+    strcpy(c.author, pes_author());
+    c.timestamp = (uint64_t)time(NULL);
+    strcpy(c.message, message);
+
+    void *raw;
+    size_t raw_len;
+
+    commit_serialize(&c, &raw, &raw_len);
+
+    if (object_write(OBJ_COMMIT, raw, raw_len, commit_id_out) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    free(raw);
+
+    return head_update(commit_id_out);
+}
+
+// Walk commit history
+int commit_walk(commit_walk_fn callback, void *ctx) {
+    ObjectID id;
+
+    if (head_read(&id) != 0)
+        return -1;
+
+    while (1) {
+        ObjectType type;
+        void *raw;
+        size_t len;
+
+        if (object_read(&id, &type, &raw, &len) != 0)
+            return -1;
+
+        Commit c;
+        commit_parse(raw, len, &c);
+        free(raw);
+
+        callback(&id, &c, ctx);
+
+        if (!c.has_parent)
+            break;
+
+        id = c.parent;
+    }
+
+    return 0;
+}    const char *p = (const char *)data;
     char hex[HASH_HEX_SIZE + 1];
 
     // "tree <hex>\n"
